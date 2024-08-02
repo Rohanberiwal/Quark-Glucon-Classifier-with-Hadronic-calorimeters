@@ -1,102 +1,170 @@
-import pandas as pd
-import os
-from sklearn.model_selection import train_test_split
 import torch
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import models
-import numpy as np 
+from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
+from torchvision import transforms, models
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
 
-class ParquetDataset(Dataset):
-    def __init__(self, data, transform=None):
-        self.data = data
-        self.transform = transform
+class ResNet152(nn.Module):
+    def __init__(self, num_classes=2):
+        super(ResNet152, self).__init__()
+        # Load the pre-trained ResNet-152 model
+        self.resnet152 = models.resnet152(pretrained=True)
+        # Modify the final fully connected layer for binary classification
+        in_features = self.resnet152.fc.in_features
+        self.resnet152.fc = nn.Linear(in_features, num_classes)
 
-    def __len__(self):
-        return len(self.data)
+    def forward(self, x):
+        return self.resnet152(x)
 
-    def __getitem__(self, idx):
-        # Extract matrix data and label
-        matrix_data = self.data.iloc[idx]['X_jets']  # 'X_jets' is the matrix data
-        label = int(self.data.iloc[idx]['y'])  # 'y' is the label
+def generate_sample_data(num_samples=1000, image_size=(125, 125)):
+    def generate_image():
+        image = np.random.rand(image_size[0], image_size[1], 3) * 255
+        image = image.astype(np.uint8)
+        return image
 
-        # Convert matrix to tensor
-        matrix = np.array(matrix_data, dtype=np.float32)  # Ensure numpy array conversion
-        matrix = torch.tensor(matrix, dtype=torch.float32)
+    quark_list = []
+    gluon_list = []
 
-        # Ensure the tensor is of shape (C, H, W)
-        if matrix.ndim == 2:
-            matrix = matrix.unsqueeze(0)  # Add a channel dimension
-        elif matrix.ndim == 3:
-            matrix = matrix.permute(2, 0, 1)  # From (H, W, C) to (C, H, W)
-
-        # Apply transformations if provided
-        if self.transform:
-            matrix = self.transform(matrix)
-
-        return matrix, label
-
-def read_and_split_parquet_file(file_path):
-    # Check if the provided file path exists
-    if not os.path.isfile(file_path):
-        print(f"File '{file_path}' does not exist.")
-        return
-
-    # Check if the file has a .parquet extension
-    if not file_path.endswith('.parquet'):
-        print(f"File '{file_path}' is not a .parquet file.")
-        return
-
-    try:
-        # Open the .parquet file and read its contents
-        contents = pd.read_parquet(file_path)
-        print(f"Contents of {file_path}:")
-        print(contents.head())
-        print("-" * 40)  # Separator line for clarity
-
-        # Split the data into 80% training and 20% validation
-        train_data, val_data = train_test_split(contents, test_size=0.2, random_state=42)
+    for _ in range(num_samples):
+        quark_image_array = generate_image()
+        quark_list.append([quark_image_array, 1])
         
-        # Print the number of records in the training and validation sets
-        print(f"Number of records in the training set: {len(train_data)}")
-        print(f"Number of records in the validation set: {len(val_data)}")
+        gluon_image_array = generate_image()
+        gluon_list.append([gluon_image_array, 0])
 
-        return train_data, val_data
+    return quark_list, gluon_list
 
-    except Exception as e:
-        print(f"Error reading file '{file_path}': {e}")
-        return None, None
-
-def load_data_into_resnet152(train_data, val_data, batch_size=32):
+def to_tensor(data_list):
     transform = transforms.Compose([
+        transforms.ToPILImage(), 
+        transforms.Resize((125, 125)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = ParquetDataset(train_data, transform=transform)
-    val_dataset = ParquetDataset(val_data, transform=transform)
+    images = []
+    labels = []
+    for image_array, label in data_list:
+        image = transform(image_array)
+        images.append(image)
+        labels.append(torch.tensor(label, dtype=torch.long))
+    return images, labels
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+class ParticleDataset(Dataset):
+    def __init__(self, images, labels):
+        self.images = images
+        self.labels = labels
 
-    # Load pre-trained ResNet-152 model
-    model = models.resnet152(pretrained=True)
-    
-    # Modify the final fully connected layer for binary classification
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, 2)  # Assuming binary classification
+    def __len__(self):
+        return len(self.images)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    def __getitem__(self, idx):
+        return self.images[idx], self.labels[idx]
 
-    return model, train_loader, val_loader, criterion, optimizer
+def split_dataset(dataset, train_ratio=0.8):
+    split_idx = int(len(dataset) * train_ratio)
+    train_data = Subset(dataset, range(split_idx))
+    test_data = Subset(dataset, range(split_idx, len(dataset)))
+    return train_data, test_data
 
-# Example usage
-file_path = r"C:\Users\rohan\OneDrive\Desktop\Quark_dataset\QCDToGGQQ_IMGjet_RH1all_jet0_run0_n36272.test.snappy.parquet"
-train_data, val_data = read_and_split_parquet_file(file_path)
-if train_data is not None and val_data is not None:
-    model, train_loader, val_loader, criterion, optimizer = load_data_into_resnet152(train_data, val_data)
-    print("Data loaded into ResNet-152 model.")
-print("End of file processing")
+def l1_l2_regularization(model, l1_lambda=0.0, l2_lambda=0.0):
+    l1_norm = sum(p.abs().sum() for p in model.parameters())
+    l2_norm = sum(p.pow(2).sum() for p in model.parameters())
+    return l1_lambda * l1_norm + l2_lambda * l2_norm
+
+def ensemble_predict(models, dataloader):
+    all_preds = []
+    with torch.no_grad():
+        for images, _ in dataloader:
+            outputs = torch.mean(torch.stack([model(images) for model in models]), dim=0)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+    return np.array(all_preds)
+
+def main():
+    # Generate sample data
+    quark_list, gluon_list = generate_sample_data()
+
+    # Convert to tensors
+    quark_images, quark_labels = to_tensor(quark_list)
+    gluon_images, gluon_labels = to_tensor(gluon_list)
+
+    # Create datasets
+    quark_dataset = ParticleDataset(quark_images, quark_labels)
+    gluon_dataset = ParticleDataset(gluon_images, gluon_labels)
+
+    # Split datasets
+    quark_train, quark_test = split_dataset(quark_dataset)
+    gluon_train, gluon_test = split_dataset(gluon_dataset)
+
+    # Combine datasets
+    train_dataset = ConcatDataset([quark_train, gluon_train])
+    test_dataset = ConcatDataset([quark_test, gluon_test])
+
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+    # Initialize models for ensemble
+    num_models = 3
+    models = [ResNet152() for _ in range(num_models)]
+    criterions = [nn.CrossEntropyLoss() for _ in range(num_models)]
+    optimizers = [optim.Adam(model.parameters(), lr=0.001) for model in models]
+
+    num_epochs = 50
+    for epoch in range(num_epochs):
+        for model, criterion, optimizer in zip(models, criterions, optimizers):
+            model.train()
+            running_loss = 0.0
+            for images, labels in train_loader:
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss += l1_l2_regularization(model, l1_lambda=0.001, l2_lambda=0.001)  # Add regularization
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+
+            # Calculate training loss
+            train_loss = running_loss / len(train_loader)
+
+            # Validation
+            model.eval()
+            val_loss = 0.0
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    _, predicted = torch.max(outputs, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+
+            # Calculate validation loss and accuracy
+            val_loss /= len(test_loader)
+            val_accuracy = 100 * correct / total
+
+            # Print metrics
+            print(f"Model Epoch {epoch+1}/{num_epochs}")
+            print(f"Training Loss: {train_loss:.4f}")
+            print(f"Validation Loss: {val_loss:.4f}")
+            print(f"Validation Accuracy: {val_accuracy:.2f}%")
+
+    # Evaluate ensemble
+    ensemble_preds = ensemble_predict(models, test_loader)
+    true_labels = np.concatenate([labels.numpy() for _, labels in test_loader])
+    correct = (ensemble_preds == true_labels).sum()
+    accuracy = 100 * correct / len(test_dataset)
+
+    print(f"Ensemble Validation Accuracy: {accuracy:.2f}%")
+
+    print("Training complete.")
+    print("THIS CODE END HERE BUT WITH MODIFICATION")
+
+if __name__ == "__main__":
+    main()
